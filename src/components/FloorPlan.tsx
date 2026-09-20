@@ -1,6 +1,9 @@
 /**
  * 展厅平面图（SVG）。
- * - 内部单位 = 米；根 <g> 做 scale/pan 仿射，指针事件用 screenToWorld 精确换算。
+ * - 内部单位 = 米；根 <g> 做 scale/pan 仿射。指针坐标经 lib/camera 的
+ *   client→local→world 唯一边界只换算一次，缩放/平移/旋转/DPR 均不累积误差。
+ * - 视口（scale/pan）与指针会话以 ref 为真相源，window 监听只绑定一次，
+ *   拖动中改变缩放会重新锚定抓取点；pointercancel/捕获丢失安全回退。
  * - 拖动 / 8 手柄缩放 / 旋转，全程吸附 0.5 m；交互中 live 更新，松手提交一条历史。
  * - 告警直接上图：重叠区域红色斜纹、净空尺寸标注、不可达接待点 ✕、封堵出口红叉，
  *   并配合字符徽标（不只靠颜色）。
@@ -20,34 +23,44 @@ import {
   rectOf,
   intersects,
 } from '../lib/geometry';
-import { screenToWorld, snapResize, snapToGrid } from '../lib/grid';
+import { snapResize, snapToGrid } from '../lib/grid';
+import {
+  clampPan,
+  clientToLocal,
+  clientToWorld,
+  fitViewport,
+  zoomAt,
+  zoomCentered,
+  clampDragPosition,
+  type Viewport,
+} from '../lib/camera';
 
 type HandleId = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
 
 interface DragSession {
   type: 'drag';
   boothId: string;
-  /** 抓取点相对展位左上角的偏移（米） */
+  /** 抓取点相对展位左上角的偏移（米）；拖动中若改变缩放会重新锚定，保证不漂移。 */
   grab: Point;
+  pointerId: number;
 }
 interface ResizeSession {
   type: 'resize';
   boothId: string;
   handle: HandleId;
   start: { x: number; y: number; w: number; h: number };
+  pointerId: number;
 }
 interface PanSession {
   type: 'pan';
-  startPx: Point;
+  startClient: Point;
   startPan: Point;
   moved: boolean;
+  pointerId: number;
 }
 type Session = DragSession | ResizeSession | PanSession;
 
 const MIN_SIZE = GRID_SIZE;
-// 缩放倍率上下限（相对于“适应窗口”的基准比例）
-const ZOOM_RATIO_MIN = 0.3;
-const ZOOM_RATIO_MAX = 6;
 
 interface FloorPlanProps {
   planner: PlannerApi;
@@ -66,225 +79,288 @@ export function FloorPlan({
 }: FloorPlanProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [size, setSize] = useState({ w: 1000, h: 700 });
-  const [scale, setScale] = useState(40); // 每米像素数
-  const [pan, setPan] = useState<Point>({ x: 40, y: 40 });
+  const sizeRef = useRef(size);
+  sizeRef.current = size;
+
+  /*
+   * 视口（scale/pan）以 ref 为唯一真相源，另用一个 tick 触发渲染。
+   * 这样滚轮/指针监听只需在挂载时绑定一次，处理函数在任何时刻读到的
+   * scale/pan 都是最新值——不会因为 React 监听器重绑而把旧缩放混进新坐标。
+   */
   const baseScaleRef = useRef(40);
-  const [session, setSession] = useState<Session | null>(null);
+  const viewRef = useRef<Viewport>({ scale: 40, pan: { x: 40, y: 40 } });
+  const [, setViewTick] = useState(0);
+  const commitView = useCallback((vp: Viewport) => {
+    viewRef.current = vp;
+    setViewTick((n) => n + 1);
+  }, []);
+
+  const [sessionState, setSessionState] = useState<Session | null>(null);
   const sessionRef = useRef<Session | null>(null);
-  sessionRef.current = session;
+  const setSession = useCallback((s: Session | null) => {
+    sessionRef.current = s;
+    setSessionState(s);
+  }, []);
+
+  /** 最近一次指针位置（client 像素），用于拖动中改变缩放后重新锚定抓取点。 */
+  const lastPointerRef = useRef<Point | null>(null);
   const panMovedRef = useRef(false);
 
+  /** 始终指向最新 planner，使全局指针监听不必随状态变化重新绑定。 */
+  const plannerRef = useRef(planner);
+  plannerRef.current = planner;
+
   const { booths, analysis, selectedId } = planner;
+
+  const view = viewRef.current;
+  const scale = view.scale;
+  const pan = view.pan;
+  const session = sessionState;
 
   /* ---------- 尺寸与适应窗口 ---------- */
   /** 画布容器（svg 的父节点 .canvas-wrap）。 */
   const containerEl = () => svgRef.current?.parentElement ?? null;
 
-  /** 把绝对比例（像素/米）钳制在允许的缩放倍率区间内。 */
-  const clampScaleAbs = useCallback(
-    (s: number) =>
-      Math.max(
-        baseScaleRef.current * ZOOM_RATIO_MIN,
-        Math.min(baseScaleRef.current * ZOOM_RATIO_MAX, s),
-      ),
-    [],
-  );
-
   const fit = useCallback(() => {
     const el = containerEl();
     if (!el) return;
-    const cw = el.clientWidth;
-    const ch = el.clientHeight;
-    const s = Math.min((cw - 90) / HALL_WIDTH, (ch - 110) / HALL_HEIGHT);
-    baseScaleRef.current = s; // 100% 基准
-    setScale(s);
-    setPan({
-      x: (cw - HALL_WIDTH * s) / 2,
-      y: (ch - HALL_HEIGHT * s) / 2 - 6,
-    });
-  }, []);
+    const f = fitViewport({ w: el.clientWidth, h: el.clientHeight });
+    baseScaleRef.current = f.baseScale; // 100% 基准
+    commitView({ scale: f.scale, pan: f.pan });
+  }, [commitView]);
 
   useLayoutEffect(() => {
     const el = containerEl();
     if (!el) return;
     fit();
     // 窗口尺寸变化只更新自身尺寸，不重置用户的缩放/平移
-    const ro = new ResizeObserver(() => {
-      setSize({ w: el.clientWidth, h: el.clientHeight });
-    });
-    ro.observe(el);
-    setSize({ w: el.clientWidth, h: el.clientHeight });
-    return () => ro.disconnect();
+    const update = () => setSize({ w: el.clientWidth, h: el.clientHeight });
+    let ro: ResizeObserver | undefined;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(update);
+      ro.observe(el);
+    }
+    window.addEventListener('resize', update);
+    update();
+    return () => {
+      ro?.disconnect();
+      window.removeEventListener('resize', update);
+    };
   }, [fit]);
 
+  // 仅当比例（或回调）变化时把缩放百分比同步给父级；平移/拖动引起的重渲染不触发。
   useEffect(() => {
-    onZoomChange(scale / baseScaleRef.current);
+    onZoomChange(viewRef.current.scale / baseScaleRef.current);
   }, [scale, onZoomChange]);
 
-  const clampPan = useCallback(
-    (p: Point, s: number) => {
-      const cw = size.w;
-      const ch = size.h;
-      const ws = HALL_WIDTH * s;
-      const hs = HALL_HEIGHT * s;
-      const minX = Math.min(24, cw - ws - 24);
-      const maxX = Math.max(cw - 24, 24);
-      const minY = Math.min(24, ch - hs - 24);
-      const maxY = Math.max(ch - 24, 24);
-      return {
-        x: Math.min(maxX, Math.max(minX, p.x)),
-        y: Math.min(maxY, Math.max(minY, p.y)),
-      };
-    },
-    [size],
-  );
+  /* ---------- 坐标换算：client 像素只在这里过一次边界，得到世界米坐标 ---------- */
+  const toWorld = useCallback((clientX: number, clientY: number): Point => {
+    const svg = svgRef.current;
+    if (!svg) return { x: 0, y: 0 };
+    return clientToWorld(
+      clientX,
+      clientY,
+      svg.getBoundingClientRect(),
+      viewRef.current,
+    );
+  }, []);
 
-  /* ---------- 坐标换算（缩放后仍精确） ---------- */
-  const toWorld = useCallback(
-    (clientX: number, clientY: number): Point => {
-      const rect = svgRef.current!.getBoundingClientRect();
-      return screenToWorld(
-        clientX - rect.left,
-        clientY - rect.top,
-        scale,
-        pan,
-      );
-    },
-    [scale, pan],
-  );
+  /**
+   * 视口变化后重新锚定拖动抓取点：用新视口把“最近指针位置”换算成世界点，
+   * 令 grab = world - 当前展位左上。这样缩放前后展位都不会跳离指针，
+   * 且不修改展位本身（仍在原网格点上），随后的移动严格 1:1 跟随。
+   */
+  const reanchorDrag = useCallback((s: DragSession, vp: Viewport) => {
+    const svg = svgRef.current;
+    const lp = lastPointerRef.current;
+    if (!svg || !lp) return;
+    const w = clientToWorld(
+      lp.x,
+      lp.y,
+      svg.getBoundingClientRect(),
+      vp,
+    );
+    const b = plannerRef.current.booths.find((x) => x.id === s.boothId);
+    if (b) s.grab = { x: w.x - b.x, y: w.y - b.y };
+  }, []);
 
   /* ---------- 滚轮以光标为锚点缩放（原生非被动监听，才能 preventDefault） ---------- */
   useEffect(() => {
     const svg = svgRef.current;
     if (!svg) return;
+    const WHEEL_FACTOR = 1.12;
     const handler = (e: WheelEvent) => {
-      if (sessionRef.current) return;
+      const s = sessionRef.current;
+      if (s?.type === 'pan') return; // 平移手势中不夹缩滚轮缩放
       e.preventDefault();
-      const rect = svg.getBoundingClientRect();
-      const px = e.clientX - rect.left;
-      const py = e.clientY - rect.top;
-      const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-      setScale((prevScale) => {
-        const next = clampScaleAbs(prevScale * factor);
-        const ratio = next / prevScale;
-        setPan((prevPan) =>
-          clampPan(
-            {
-              x: px - (px - prevPan.x) * ratio,
-              y: py - (py - prevPan.y) * ratio,
-            },
-            next,
-          ),
-        );
-        return next;
-      });
+      const local = clientToLocal(
+        e.clientX,
+        e.clientY,
+        svg.getBoundingClientRect(),
+      );
+      const next = zoomAt(
+        viewRef.current,
+        e.deltaY < 0 ? WHEEL_FACTOR : 1 / WHEEL_FACTOR,
+        local,
+        baseScaleRef.current,
+        sizeRef.current,
+      );
+      // 拖动中滚轮缩放：不结束手势、不提交历史，仅重新锚定抓取点继续拖。
+      if (s?.type === 'drag') reanchorDrag(s, next);
+      commitView(next);
     };
     svg.addEventListener('wheel', handler, { passive: false });
     return () => svg.removeEventListener('wheel', handler);
-  }, [clampPan, clampScaleAbs]);
+  }, [commitView, reanchorDrag]);
 
   const zoomBy = useCallback(
     (factor: number) => {
-      setScale((prev) => {
-        const next = clampScaleAbs(prev * factor);
-        const px = size.w / 2;
-        const py = size.h / 2;
-        const ratio = next / prev;
-        setPan((oldPan) =>
-          clampPan(
-            {
-              x: px - (px - oldPan.x) * ratio,
-              y: py - (py - oldPan.y) * ratio,
-            },
-            next,
-          ),
-        );
-        return next;
-      });
+      const next = zoomCentered(
+        viewRef.current,
+        factor,
+        baseScaleRef.current,
+        sizeRef.current,
+      );
+      const s = sessionRef.current;
+      if (s?.type === 'drag') reanchorDrag(s, next);
+      commitView(next);
     },
-    [clampPan, clampScaleAbs, size],
+    [commitView, reanchorDrag],
   );
 
   /* ---------- 指针会话 ---------- */
+  /** 在稳定的 svg 根节点上捕获指针；测试/不支持活动指针的环境下静默跳过。 */
+  const capturePointer = (id: number) => {
+    try {
+      svgRef.current?.setPointerCapture?.(id);
+    } catch {
+      /* jsdom 等环境可能没有活动指针，忽略即可（window 监听仍能收到事件）。 */
+    }
+  };
+
   const startBoothDrag = (e: React.PointerEvent, b: Booth) => {
     e.stopPropagation();
-    (e.target as Element).setPointerCapture?.(e.pointerId);
-    planner.selectBooth(b.id);
+    // 捕获设在稳定的 svg 根节点上（而不是不断重挂载的展位元素），
+    // 拖动期间 React 重渲染也不会丢失后续事件。
+    capturePointer(e.pointerId);
+    plannerRef.current.beginInteraction();
+    plannerRef.current.selectBooth(b.id);
     const w = toWorld(e.clientX, e.clientY);
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
     setSession({
       type: 'drag',
       boothId: b.id,
       grab: { x: w.x - b.x, y: w.y - b.y },
+      pointerId: e.pointerId,
     });
   };
 
   const startResize = (e: React.PointerEvent, b: Booth, handle: HandleId) => {
     e.stopPropagation();
-    (e.target as Element).setPointerCapture?.(e.pointerId);
-    planner.selectBooth(b.id);
+    capturePointer(e.pointerId);
+    plannerRef.current.beginInteraction();
+    plannerRef.current.selectBooth(b.id);
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
     setSession({
       type: 'resize',
       boothId: b.id,
       handle,
       start: { x: b.x, y: b.y, w: b.w, h: b.h },
+      pointerId: e.pointerId,
     });
   };
 
   const startPan = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
+    // 平移是纯视口操作、无需恢复展位状态，不设指针捕获（保留单击空白取消选中）。
+    lastPointerRef.current = { x: e.clientX, y: e.clientY };
     setSession({
       type: 'pan',
-      startPx: { x: e.clientX, y: e.clientY },
-      startPan: pan,
+      startClient: { x: e.clientX, y: e.clientY },
+      startPan: viewRef.current.pan,
       moved: false,
+      pointerId: e.pointerId,
     });
   };
 
+  /* 全局指针监听只绑定一次：缩放/平移变化不再引起重绑，杜绝新旧闭包混用。 */
   useEffect(() => {
-    if (!session) return;
+    const svg = svgRef.current;
 
     const onMove = (e: PointerEvent) => {
       const s = sessionRef.current;
-      if (!s) return;
+      if (!s || e.pointerId !== s.pointerId) return;
+      lastPointerRef.current = { x: e.clientX, y: e.clientY };
       if (s.type === 'pan') {
-        const dx = e.clientX - s.startPx.x;
-        const dy = e.clientY - s.startPx.y;
+        const dx = e.clientX - s.startClient.x;
+        const dy = e.clientY - s.startClient.y;
         if (Math.abs(dx) + Math.abs(dy) > 3) s.moved = true;
-        setPan(clampPan({ x: s.startPan.x + dx, y: s.startPan.y + dy }, scale));
+        commitView({
+          scale: viewRef.current.scale,
+          pan: clampPan(
+            { x: s.startPan.x + dx, y: s.startPan.y + dy },
+            viewRef.current.scale,
+            sizeRef.current,
+          ),
+        });
         return;
       }
-      const w = toWorld(e.clientX, e.clientY);
+      // client -> world 只转换一次；之后碰撞/净空/寻路全部使用这个世界坐标。
+      const w = clientToWorld(
+        e.clientX,
+        e.clientY,
+        svg!.getBoundingClientRect(),
+        viewRef.current,
+      );
       if (s.type === 'drag') {
-        // 允许拖出边界以演示“越界”告警，但限制在展厅附近、且保留可见部分。
-        const nx = Math.min(
-          HALL_WIDTH - MIN_SIZE,
-          Math.max(-4, snapToGrid(w.x - s.grab.x)),
+        const pos = clampDragPosition(
+          snapToGrid(w.x - s.grab.x),
+          snapToGrid(w.y - s.grab.y),
+          MIN_SIZE,
         );
-        const ny = Math.min(
-          HALL_HEIGHT - MIN_SIZE,
-          Math.max(-4, snapToGrid(w.y - s.grab.y)),
-        );
-        planner.liveUpdateBooth(s.boothId, { x: nx, y: ny });
+        plannerRef.current.liveUpdateBooth(s.boothId, pos);
       } else {
         const patch = applyHandle(s.start, s.handle, w.x, w.y);
-        planner.liveUpdateBooth(s.boothId, patch);
+        plannerRef.current.liveUpdateBooth(s.boothId, patch);
       }
     };
 
-    const onUp = () => {
+    /** 结束手势。cancelled=true（pointercancel/捕获丢失）时恢复交互前状态。 */
+    const finish = (e: PointerEvent, cancelled: boolean) => {
       const s = sessionRef.current;
-      if (s && s.type !== 'pan') planner.commitInteraction();
-      if (s?.type === 'pan') panMovedRef.current = s.moved;
+      if (!s || e.pointerId !== s.pointerId) return;
+      // 先清会话再让浏览器隐式释放捕获（lostpointercapture 随后触发时即为空操作）。
       setSession(null);
+      lastPointerRef.current = null;
+      if (s.type === 'pan') {
+        if (!cancelled) panMovedRef.current = s.moved;
+        return;
+      }
+      if (cancelled) plannerRef.current.cancelInteraction();
+      else plannerRef.current.commitInteraction();
+    };
+
+    const onUp = (e: PointerEvent) => finish(e, false);
+    const onCancel = (e: PointerEvent) => finish(e, true);
+    // 捕获被系统/其他元素意外夺走（窗口失焦、触摸被打断等）：按取消安全结束，
+    // 展位回到交互前网格位置，不留半截 live 状态。
+    const onLostCapture = (e: PointerEvent) => {
+      const s = sessionRef.current;
+      if (!s || e.pointerId !== s.pointerId) return;
+      finish(e, true);
     };
 
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    svg?.addEventListener('lostpointercapture', onLostCapture);
     return () => {
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      svg?.removeEventListener('lostpointercapture', onLostCapture);
     };
-  }, [session, scale, toWorld, clampPan, planner]);
+  }, [commitView, setSession]);
 
   /* ---------- 双击添加 / 单击空白取消选中 ---------- */
   const onDoubleClick = (e: React.MouseEvent) => {
@@ -374,7 +450,10 @@ export function FloorPlan({
           </pattern>
         </defs>
 
-        <g transform={`translate(${pan.x},${pan.y}) scale(${scale})`}>
+        <g
+          data-world-root
+          transform={`translate(${pan.x},${pan.y}) scale(${scale})`}
+        >
           {/* 展厅外底色 */}
           <rect
             x={-1.2}
@@ -390,6 +469,7 @@ export function FloorPlan({
             width={HALL_WIDTH}
             height={HALL_HEIGHT}
             fill="#fcfdfe"
+            data-testid="hall"
             onPointerDown={startPan}
             onDoubleClick={onDoubleClick}
             onClick={onBackgroundClick}
@@ -799,6 +879,7 @@ function BoothView({
         strokeWidth={(selected ? 2.6 : 1.4) * u}
         strokeDasharray={isPartition ? `${0.0} ${0.0}` : undefined}
         style={{ cursor: 'move' }}
+        data-booth-id={b.id}
         onPointerDown={onPointerDown}
       />
 
@@ -975,6 +1056,7 @@ function BoothView({
             r={0.16}
             fill="#1d4ed8"
             pointerEvents="all"
+            data-testid="rotate-btn"
             style={{ cursor: 'pointer' }}
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => {
