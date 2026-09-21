@@ -1,11 +1,20 @@
 /**
  * 展厅平面图（SVG）。
- * - 内部单位 = 米；根 <g> 做 scale/pan 仿射，指针事件用 screenToWorld 精确换算。
- * - 拖动 / 8 手柄缩放 / 旋转，全程吸附 0.5 m；交互中 live 更新，松手提交一条历史。
- * - 告警直接上图：重叠区域红色斜纹、净空尺寸标注、不可达接待点 ✕、封堵出口红叉，
- *   并配合字符徽标（不只靠颜色）。
+ * - 内部单位 = 米；根 <g> 做 scale/pan 仿射。
+ * - 指针坐标唯一边界：lib/grid.clientToWorld（client→local→world 只转一次）；
+ *   碰撞 / 净空 / 寻路 / 尺寸输入 / 渲染共享同一组世界米坐标。
+ * - 指针会话由 lib/interaction.CanvasInteraction 管理（ref 事实源）：
+ *   拖动 / 8 手柄缩放 / 平移全程吸附 0.5 m；交互中 live 更新，结束提交一条历史。
+ * - 拖动中缩放（滚轮/按钮/适应窗口）或旋转/撤销等按键：先安全结束当前会话再执行；
+ *   pointercancel / lostpointercapture 同样按当前位置提交，绝不留下无历史的悬空态。
  */
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import type { Alert, Booth, Point } from '../types';
 import type { PlannerApi } from '../state/usePlanner';
 import {
@@ -20,31 +29,19 @@ import {
   rectOf,
   intersects,
 } from '../lib/geometry';
-import { screenToWorld, snapResize, snapToGrid } from '../lib/grid';
+import {
+  clientToWorld,
+  zoomAroundClient,
+  zoomAroundLocal,
+} from '../lib/grid';
+import type { ViewTransform } from '../lib/grid';
+import {
+  CanvasInteraction,
+  applyResizeHandle,
+  dragBoothPosition,
+} from '../lib/interaction';
+import type { HandleId, SessionKind } from '../lib/interaction';
 
-type HandleId = 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
-
-interface DragSession {
-  type: 'drag';
-  boothId: string;
-  /** 抓取点相对展位左上角的偏移（米） */
-  grab: Point;
-}
-interface ResizeSession {
-  type: 'resize';
-  boothId: string;
-  handle: HandleId;
-  start: { x: number; y: number; w: number; h: number };
-}
-interface PanSession {
-  type: 'pan';
-  startPx: Point;
-  startPan: Point;
-  moved: boolean;
-}
-type Session = DragSession | ResizeSession | PanSession;
-
-const MIN_SIZE = GRID_SIZE;
 // 缩放倍率上下限（相对于“适应窗口”的基准比例）
 const ZOOM_RATIO_MIN = 0.3;
 const ZOOM_RATIO_MAX = 6;
@@ -57,6 +54,11 @@ interface FloorPlanProps {
   onZoomChange: (zoom: number) => void;
 }
 
+const INITIAL_VIEW: ViewTransform = {
+  scale: 40,
+  pan: { x: 40, y: 40 },
+};
+
 export function FloorPlan({
   planner,
   showPaths,
@@ -66,13 +68,25 @@ export function FloorPlan({
 }: FloorPlanProps) {
   const svgRef = useRef<SVGSVGElement>(null);
   const [size, setSize] = useState({ w: 1000, h: 700 });
-  const [scale, setScale] = useState(40); // 每米像素数
-  const [pan, setPan] = useState<Point>({ x: 40, y: 40 });
+  const sizeRef = useRef(size);
+  sizeRef.current = size;
+
+  /* ---------- 视图：ref 为事实源，state 仅驱动渲染 ---------- */
+  const [view, setViewState] = useState<ViewTransform>(INITIAL_VIEW);
+  const viewRef = useRef<ViewTransform>(INITIAL_VIEW);
+  const setView = useCallback((next: ViewTransform) => {
+    viewRef.current = next;
+    setViewState(next);
+  }, []);
+  const { scale, pan } = view;
+
   const baseScaleRef = useRef(40);
-  const [session, setSession] = useState<Session | null>(null);
-  const sessionRef = useRef<Session | null>(null);
-  sessionRef.current = session;
+  const plannerRef = useRef(planner);
+  plannerRef.current = planner;
   const panMovedRef = useRef(false);
+
+  // 会话类型镜像到 state，仅用于光标样式；真实会话状态在控制器内。
+  const [activeKind, setActiveKind] = useState<SessionKind | null>(null);
 
   const { booths, analysis, selectedId } = planner;
 
@@ -89,6 +103,23 @@ export function FloorPlan({
       ),
     [],
   );
+  const clampScaleAbsRef = useRef(clampScaleAbs);
+  clampScaleAbsRef.current = clampScaleAbs;
+
+  /** 平移钳制（读 ref，供一次性挂载的事件监听器使用）。 */
+  const clampPanNow = useCallback((p: Point, s: number): Point => {
+    const { w: cw, h: ch } = sizeRef.current;
+    const ws = HALL_WIDTH * s;
+    const hs = HALL_HEIGHT * s;
+    const minX = Math.min(24, cw - ws - 24);
+    const maxX = Math.max(cw - 24, 24);
+    const minY = Math.min(24, ch - hs - 24);
+    const maxY = Math.max(ch - 24, 24);
+    return {
+      x: Math.min(maxX, Math.max(minX, p.x)),
+      y: Math.min(maxY, Math.max(minY, p.y)),
+    };
+  }, []);
 
   const fit = useCallback(() => {
     const el = containerEl();
@@ -97,12 +128,14 @@ export function FloorPlan({
     const ch = el.clientHeight;
     const s = Math.min((cw - 90) / HALL_WIDTH, (ch - 110) / HALL_HEIGHT);
     baseScaleRef.current = s; // 100% 基准
-    setScale(s);
-    setPan({
-      x: (cw - HALL_WIDTH * s) / 2,
-      y: (ch - HALL_HEIGHT * s) / 2 - 6,
+    setView({
+      scale: s,
+      pan: {
+        x: (cw - HALL_WIDTH * s) / 2,
+        y: (ch - HALL_HEIGHT * s) / 2 - 6,
+      },
     });
-  }, []);
+  }, [setView]);
 
   useLayoutEffect(() => {
     const el = containerEl();
@@ -121,174 +154,169 @@ export function FloorPlan({
     onZoomChange(scale / baseScaleRef.current);
   }, [scale, onZoomChange]);
 
-  const clampPan = useCallback(
-    (p: Point, s: number) => {
-      const cw = size.w;
-      const ch = size.h;
-      const ws = HALL_WIDTH * s;
-      const hs = HALL_HEIGHT * s;
-      const minX = Math.min(24, cw - ws - 24);
-      const maxX = Math.max(cw - 24, 24);
-      const minY = Math.min(24, ch - hs - 24);
-      const maxY = Math.max(ch - 24, 24);
-      return {
-        x: Math.min(maxX, Math.max(minX, p.x)),
-        y: Math.min(maxY, Math.max(minY, p.y)),
-      };
-    },
-    [size],
-  );
+  /* ---------- 交互控制器（整个组件生命周期只创建一次） ---------- */
+  const interactionRef = useRef<CanvasInteraction | null>(null);
+  if (interactionRef.current === null) {
+    interactionRef.current = new CanvasInteraction({
+      getRect: () => {
+        const r = svgRef.current?.getBoundingClientRect();
+        // 每次实时读取：页面/容器滚动造成的偏移在这里计入，不在多帧间累积。
+        return { left: r?.left ?? 0, top: r?.top ?? 0 };
+      },
+      getView: () => viewRef.current,
+      onDrag: (id, world, grab) => {
+        plannerRef.current.liveUpdateBooth(id, dragBoothPosition(world, grab));
+      },
+      onResize: (id, handle, start, world) => {
+        plannerRef.current.liveUpdateBooth(
+          id,
+          applyResizeHandle(start, handle, world),
+        );
+      },
+      onPan: (p) => {
+        const v = viewRef.current;
+        setView({ scale: v.scale, pan: clampPanNow(p, v.scale) });
+      },
+      onCommit: () => {
+        plannerRef.current.commitInteraction();
+        setActiveKind(null);
+      },
+      onPanEnd: (moved) => {
+        panMovedRef.current = moved;
+        setActiveKind(null);
+      },
+    });
+  }
+  const interaction = interactionRef.current;
 
-  /* ---------- 坐标换算（缩放后仍精确） ---------- */
-  const toWorld = useCallback(
-    (clientX: number, clientY: number): Point => {
-      const rect = svgRef.current!.getBoundingClientRect();
-      return screenToWorld(
-        clientX - rect.left,
-        clientY - rect.top,
-        scale,
-        pan,
-      );
-    },
-    [scale, pan],
-  );
+  /** window 级指针监听只挂载一次；具体分派全部由控制器处理。 */
+  useEffect(() => {
+    const onMove = (e: PointerEvent) =>
+      interaction.move(e.pointerId, e.clientX, e.clientY);
+    const onUp = (e: PointerEvent) => interaction.end(e.pointerId);
+    const onCancel = (e: PointerEvent) => interaction.cancel(e.pointerId);
+    const onLostCapture = (e: PointerEvent) =>
+      interaction.captureLost(e.pointerId);
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    window.addEventListener('lostpointercapture', onLostCapture);
+    return () => {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      window.removeEventListener('lostpointercapture', onLostCapture);
+    };
+  }, [interaction]);
+
+  /**
+   * 捕获阶段按键：会话进行中任何会改方案/视图的按键（旋转 R、删除、Ctrl+Z/Y、
+   * 方向键……）都先安全结束当前拖放会话，再交给 usePlanner 的常规处理器，
+   * 保证“一次手势 + 一次离散操作”各自是独立、干净的历史记录。
+   */
+  useEffect(() => {
+    const onKeyCapture = (e: KeyboardEvent) => {
+      if (!interaction.active) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+      ) {
+        return;
+      }
+      // 单纯按下修饰键不结束手势。
+      if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) return;
+      interaction.interrupt();
+    };
+    window.addEventListener('keydown', onKeyCapture, true);
+    return () => window.removeEventListener('keydown', onKeyCapture, true);
+  }, [interaction]);
 
   /* ---------- 滚轮以光标为锚点缩放（原生非被动监听，才能 preventDefault） ---------- */
   useEffect(() => {
     const svg = svgRef.current;
     if (!svg) return;
     const handler = (e: WheelEvent) => {
-      if (sessionRef.current) return;
       e.preventDefault();
+      // 拖动中改变缩放：先把当前拖放结果安全提交结束，再以光标为锚点缩放。
+      interaction.interrupt();
       const rect = svg.getBoundingClientRect();
-      const px = e.clientX - rect.left;
-      const py = e.clientY - rect.top;
       const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-      setScale((prevScale) => {
-        const next = clampScaleAbs(prevScale * factor);
-        const ratio = next / prevScale;
-        setPan((prevPan) =>
-          clampPan(
-            {
-              x: px - (px - prevPan.x) * ratio,
-              y: py - (py - prevPan.y) * ratio,
-            },
-            next,
-          ),
-        );
-        return next;
-      });
+      setView(
+        zoomAroundClient(
+          e.clientX,
+          e.clientY,
+          rect,
+          viewRef.current,
+          factor,
+          {
+            clampScale: (s) => clampScaleAbsRef.current(s),
+            clampPan: clampPanNow,
+          },
+        ),
+      );
     };
     svg.addEventListener('wheel', handler, { passive: false });
     return () => svg.removeEventListener('wheel', handler);
-  }, [clampPan, clampScaleAbs]);
+  }, [interaction, setView, clampPanNow]);
 
   const zoomBy = useCallback(
     (factor: number) => {
-      setScale((prev) => {
-        const next = clampScaleAbs(prev * factor);
-        const px = size.w / 2;
-        const py = size.h / 2;
-        const ratio = next / prev;
-        setPan((oldPan) =>
-          clampPan(
-            {
-              x: px - (px - oldPan.x) * ratio,
-              y: py - (py - oldPan.y) * ratio,
-            },
-            next,
-          ),
-        );
-        return next;
-      });
+      interaction.interrupt();
+      const { w, h } = sizeRef.current;
+      setView(
+        zoomAroundLocal(
+          { x: w / 2, y: h / 2 },
+          viewRef.current,
+          factor,
+          {
+            clampScale: (s) => clampScaleAbsRef.current(s),
+            clampPan: clampPanNow,
+          },
+        ),
+      );
     },
-    [clampPan, clampScaleAbs, size],
+    [interaction, setView, clampPanNow],
   );
 
-  /* ---------- 指针会话 ---------- */
+  const onFit = useCallback(() => {
+    interaction.interrupt();
+    fit();
+  }, [interaction, fit]);
+
+  /* ---------- 指针会话起点 ---------- */
   const startBoothDrag = (e: React.PointerEvent, b: Booth) => {
     e.stopPropagation();
     (e.target as Element).setPointerCapture?.(e.pointerId);
     planner.selectBooth(b.id);
-    const w = toWorld(e.clientX, e.clientY);
-    setSession({
-      type: 'drag',
-      boothId: b.id,
-      grab: { x: w.x - b.x, y: w.y - b.y },
-    });
+    interaction.startDrag(e.pointerId, e.clientX, e.clientY, b);
+    setActiveKind('drag');
   };
 
   const startResize = (e: React.PointerEvent, b: Booth, handle: HandleId) => {
     e.stopPropagation();
     (e.target as Element).setPointerCapture?.(e.pointerId);
     planner.selectBooth(b.id);
-    setSession({
-      type: 'resize',
-      boothId: b.id,
-      handle,
-      start: { x: b.x, y: b.y, w: b.w, h: b.h },
-    });
+    interaction.startResize(e.pointerId, e.clientX, e.clientY, b, handle);
+    setActiveKind('resize');
   };
 
   const startPan = (e: React.PointerEvent) => {
     if (e.button !== 0) return;
-    setSession({
-      type: 'pan',
-      startPx: { x: e.clientX, y: e.clientY },
-      startPan: pan,
-      moved: false,
-    });
+    // 背景上重新按下时，先结束任何残留会话（正常情况下窗口 pointerup 已结束）。
+    interaction.startPan(e.pointerId, e.clientX, e.clientY, viewRef.current.pan);
+    setActiveKind('pan');
   };
-
-  useEffect(() => {
-    if (!session) return;
-
-    const onMove = (e: PointerEvent) => {
-      const s = sessionRef.current;
-      if (!s) return;
-      if (s.type === 'pan') {
-        const dx = e.clientX - s.startPx.x;
-        const dy = e.clientY - s.startPx.y;
-        if (Math.abs(dx) + Math.abs(dy) > 3) s.moved = true;
-        setPan(clampPan({ x: s.startPan.x + dx, y: s.startPan.y + dy }, scale));
-        return;
-      }
-      const w = toWorld(e.clientX, e.clientY);
-      if (s.type === 'drag') {
-        // 允许拖出边界以演示“越界”告警，但限制在展厅附近、且保留可见部分。
-        const nx = Math.min(
-          HALL_WIDTH - MIN_SIZE,
-          Math.max(-4, snapToGrid(w.x - s.grab.x)),
-        );
-        const ny = Math.min(
-          HALL_HEIGHT - MIN_SIZE,
-          Math.max(-4, snapToGrid(w.y - s.grab.y)),
-        );
-        planner.liveUpdateBooth(s.boothId, { x: nx, y: ny });
-      } else {
-        const patch = applyHandle(s.start, s.handle, w.x, w.y);
-        planner.liveUpdateBooth(s.boothId, patch);
-      }
-    };
-
-    const onUp = () => {
-      const s = sessionRef.current;
-      if (s && s.type !== 'pan') planner.commitInteraction();
-      if (s?.type === 'pan') panMovedRef.current = s.moved;
-      setSession(null);
-    };
-
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    return () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-    };
-  }, [session, scale, toWorld, clampPan, planner]);
 
   /* ---------- 双击添加 / 单击空白取消选中 ---------- */
   const onDoubleClick = (e: React.MouseEvent) => {
-    const w = toWorld(e.clientX, e.clientY);
+    const rect = svgRef.current!.getBoundingClientRect();
+    const w = clientToWorld(
+      e.clientX,
+      e.clientY,
+      { left: rect.left, top: rect.top },
+      viewRef.current,
+    );
     if (w.x < 0 || w.y < 0 || w.x > HALL_WIDTH || w.y > HALL_HEIGHT) return;
     planner.addBoothAt(w.x, w.y);
   };
@@ -334,7 +362,10 @@ export function FloorPlan({
     <>
       <svg
         ref={svgRef}
-        style={{ cursor: session?.type === 'pan' ? 'grabbing' : 'default' }}
+        style={{
+          cursor: activeKind === 'pan' ? 'grabbing' : 'default',
+          touchAction: 'none',
+        }}
       >
         <defs>
           <pattern
@@ -474,7 +505,7 @@ export function FloorPlan({
       <ZoomControls
         onZoomIn={() => zoomBy(1.2)}
         onZoomOut={() => zoomBy(1 / 1.2)}
-        onFit={fit}
+        onFit={onFit}
         zoomText={`${Math.round((scale / baseScaleRef.current) * 100)}%`}
       />
     </>
@@ -798,7 +829,7 @@ function BoothView({
         stroke={selected ? '#1d4ed8' : '#1f2937'}
         strokeWidth={(selected ? 2.6 : 1.4) * u}
         strokeDasharray={isPartition ? `${0.0} ${0.0}` : undefined}
-        style={{ cursor: 'move' }}
+        style={{ cursor: 'move', touchAction: 'none' }}
         onPointerDown={onPointerDown}
       />
 
@@ -1081,37 +1112,6 @@ function handleCursor(h: HandleId): string {
   if (h === 'e' || h === 'w') return 'ew-resize';
   if (h === 'nw' || h === 'se') return 'nwse-resize';
   return 'nesw-resize';
-}
-
-/* ================= 缩放手柄几何 ================= */
-
-function applyHandle(
-  start: { x: number; y: number; w: number; h: number },
-  handle: HandleId,
-  worldX: number,
-  worldY: number,
-): Partial<Booth> {
-  const px = snapToGrid(worldX);
-  const py = snapToGrid(worldY);
-  let { x, y, w, h } = start;
-
-  if (handle.includes('e')) {
-    w = snapResize(px - start.x);
-  }
-  if (handle.includes('w')) {
-    const left = Math.min(px, start.x + start.w - MIN_SIZE);
-    w = snapResize(start.x + start.w - left);
-    x = snapToGrid(start.x + start.w - w);
-  }
-  if (handle.includes('s')) {
-    h = snapResize(py - start.y);
-  }
-  if (handle.includes('n')) {
-    const top = Math.min(py, start.y + start.h - MIN_SIZE);
-    h = snapResize(start.y + start.h - top);
-    y = snapToGrid(start.y + start.h - h);
-  }
-  return { x, y, w, h };
 }
 
 /* ================= 几何辅助 ================= */
